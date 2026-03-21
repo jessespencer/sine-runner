@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sine Runner</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a1a; }
+  canvas { display: block; }
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; background: rgba(10,10,26,0.92);
+    color: #e0e0ff; font-family: monospace; cursor: pointer; z-index: 10;
+  }
+  #overlay h1 { font-size: 3rem; margin-bottom: 1rem; color: #7af; }
+  #overlay p { font-size: 1.1rem; margin: 0.3rem 0; color: #aac; }
+  #overlay .start { font-size: 1.5rem; margin-top: 2rem; color: #5f5; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="overlay">
+  <h1>🎵 Sine Runner</h1>
+  <p>Arrow keys / WASD — Move & Jump</p>
+  <p>Space — Jump</p>
+  <p>Every move you make shapes the music.</p>
+  <p class="start">[ Click anywhere to start ]</p>
+</div>
+<script>
+(() => {
+'use strict';
+
+// ─── Canvas Setup ───────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
+resize();
+addEventListener('resize', resize);
+
+// ─── Event Bus ──────────────────────────────────────────────
+const bus = (() => {
+  const listeners = {};
+  return {
+    on(e, cb) { (listeners[e] ||= []).push(cb); },
+    emit(e, data) { (listeners[e] || []).forEach(cb => cb(data)); }
+  };
+})();
+
+// ─── Util ───────────────────────────────────────────────────
+const lerp = (a, b, t) => a + (b - a) * Math.max(0, Math.min(1, t));
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const rand = (a, b) => Math.random() * (b - a) + a;
+
+// ─── Parallax ───────────────────────────────────────────────
+let stars = [], mountains = [], trees = [];
+function regenerateParallax() {
+  const hueShift = (currentLevel - 1) * 40;
+  stars = Array.from({ length: 120 }, () => ({
+    x: rand(0, LEVEL_WIDTH * 1.5), y: rand(0, 600), r: rand(0.5, 2.5), b: rand(0.3, 1)
+  }));
+  mountains = Array.from({ length: 30 }, () => ({
+    x: rand(-200, LEVEL_WIDTH * 1.2), w: rand(120, 300), h: rand(80, 200),
+    c: `hsl(${rand(220,260) + hueShift}, 30%, ${rand(12,22)}%)`
+  }));
+  trees = Array.from({ length: 60 }, () => ({
+    x: rand(-100, LEVEL_WIDTH * 1.1), h: rand(40, 100),
+    c: `hsl(${rand(130,170) + hueShift}, ${rand(20,40)}%, ${rand(15,25)}%)`
+  }));
+}
+
+// ─── Level System ───────────────────────────────────────────
+const GROUND_Y = 500;
+let LEVEL_WIDTH = 8000;
+const platforms = [];
+const coins = [];
+const enemies = [];
+let currentLevel = 1;
+const MAX_LEVEL = 5;
+let levelTransitioning = false;
+let levelBannerTimer = 0;
+let totalCoinsInLevel = 0;
+
+// Melody frequency ranges per level — each level shifts higher
+const MELODY_RANGES = [
+  [110, 440],   // Level 1: low register
+  [165, 660],   // Level 2: mid-low
+  [220, 880],   // Level 3: mid
+  [330, 1320],  // Level 4: mid-high
+  [440, 1760],  // Level 5: high register
+];
+
+// Level color themes (background tint)
+const LEVEL_THEMES = [
+  { bg: '#0a0a1a', ground: '#1a2a1a', accent: '#2d4a2d', plat: '#334', platTop: '#556' },
+  { bg: '#0a0f1a', ground: '#1a2030', accent: '#2d3a5d', plat: '#335', platTop: '#558' },
+  { bg: '#120a1a', ground: '#261a2a', accent: '#4a2d4a', plat: '#434', platTop: '#656' },
+  { bg: '#1a0a0a', ground: '#2a1a1a', accent: '#4a2d2d', plat: '#433', platTop: '#655' },
+  { bg: '#0a1a12', ground: '#1a2a20', accent: '#2d4a3a', plat: '#343', platTop: '#565' },
+];
+
+function generateLevel() {
+  platforms.length = 0;
+  coins.length = 0;
+  enemies.length = 0;
+  totalCoinsInLevel = 0;
+
+  const lvl = currentLevel;
+  // Each level gets wider
+  LEVEL_WIDTH = 6000 + lvl * 2000;
+
+  // Ground
+  platforms.push({ x: -200, y: GROUND_Y, w: LEVEL_WIDTH + 400, h: 80 });
+
+  // Generate platforms procedurally — early levels have low, easy-to-reach platforms
+  const platCount = 25 + lvl * 8;
+  // Level 1: platforms mostly 350-440 (easy hops), Level 5: up to 120
+  const minY = Math.max(120, 350 - lvl * 50);
+  const maxY = lvl <= 2 ? 440 : 420 - lvl * 5;
+  const spacing = (LEVEL_WIDTH - 400) / platCount;
+
+  for (let i = 0; i < platCount; i++) {
+    const x = 250 + i * spacing + rand(-40, 40);
+    const y = rand(minY, maxY);
+    // Early levels: wider platforms, later levels: narrower
+    const w = rand(120, 220) - lvl * 10;
+    platforms.push({ x, y, w: Math.max(80, w), h: 18 });
+  }
+
+  // Coins on every platform + bonus coins on higher platforms
+  for (let i = 1; i < platforms.length; i++) {
+    const p = platforms[i];
+    coins.push({ x: p.x + p.w / 2, y: p.y - 30, collected: false, bobOffset: rand(0, Math.PI * 2) });
+    if (Math.random() > 0.35) {
+      coins.push({ x: p.x + p.w / 2 - 25, y: p.y - 30, collected: false, bobOffset: rand(0, Math.PI * 2) });
+    }
+    // High platforms get extra coins as reward
+    if (p.y < 200 && Math.random() > 0.3) {
+      coins.push({ x: p.x + p.w / 2 + 25, y: p.y - 30, collected: false, bobOffset: rand(0, Math.PI * 2) });
+    }
+  }
+  // Ground coins
+  for (let x = 200; x < LEVEL_WIDTH; x += rand(200, 450)) {
+    coins.push({ x, y: GROUND_Y - 30, collected: false, bobOffset: rand(0, Math.PI * 2) });
+  }
+  totalCoinsInLevel = coins.length;
+
+  // Enemies — more and faster at higher levels
+  const enemyFreq = Math.max(2, 5 - lvl); // every Nth platform gets an enemy
+  for (let i = 1; i < platforms.length; i++) {
+    if (i % enemyFreq === 0) {
+      const p = platforms[i];
+      if (p.w >= 90) {
+        enemies.push({
+          x: p.x + 20, y: p.y - 24, w: 24, h: 24,
+          patrolLeft: p.x, patrolRight: p.x + p.w - 24,
+          speed: rand(0.8, 1.2) + lvl * 0.2, dir: 1
+        });
+      }
+    }
+  }
+  // Ground enemies — denser at higher levels
+  const groundEnemySpacing = Math.max(400, 1200 - lvl * 150);
+  for (let x = 500; x < LEVEL_WIDTH - 200; x += rand(groundEnemySpacing, groundEnemySpacing + 300)) {
+    enemies.push({
+      x, y: GROUND_Y - 24, w: 24, h: 24,
+      patrolLeft: x - 60 - lvl * 10, patrolRight: x + 60 + lvl * 10,
+      speed: rand(0.8, 1.2) + lvl * 0.15, dir: 1
+    });
+  }
+
+  // Level end gate
+  levelTransitioning = false;
+
+  // Regenerate parallax for new level
+  regenerateParallax();
+}
+
+function nextLevel() {
+  if (currentLevel >= MAX_LEVEL) return; // You've won!
+  levelTransitioning = true;
+  levelBannerTimer = 120; // ~2 seconds
+  currentLevel++;
+  state.coinsCollected = 0; // reset coins for filter ratio
+  player.x = 80;
+  player.y = GROUND_Y - player.h;
+  player.vx = 0;
+  player.vy = 0;
+  camera.x = 0;
+  camera.y = 0;
+  generateLevel();
+}
+generateLevel();
+
+// ─── Player ─────────────────────────────────────────────────
+const player = {
+  x: 80, y: GROUND_Y - 40, w: 28, h: 36,
+  vx: 0, vy: 0, grounded: false,
+  health: 1, invincible: 0, facing: 1
+};
+
+// ─── State ──────────────────────────────────────────────────
+const state = {
+  velocityX: 0, velocityY: 0, yPosition: 0,
+  health: 1, enemyProximity: 0,
+  isGrounded: false, coinsCollected: 0, bpm: 100
+};
+
+// ─── Input ──────────────────────────────────────────────────
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true; e.preventDefault(); });
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+// ─── Camera ─────────────────────────────────────────────────
+const camera = { x: 0, y: 0 };
+
+
+// ─── Audio Engine ───────────────────────────────────────────
+let audioCtx, masterGain, filterNode;
+let melodyOsc, melodyGain;
+let tensionOsc1, tensionOsc2, tensionGain, tensionFilter;
+let sequencerTimer = null;
+let sequencerStep = 0;
+let sequencerInterval = 125; // ms per step
+
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  // Master chain: filter → gain → destination
+  filterNode = audioCtx.createBiquadFilter();
+  filterNode.type = 'lowpass';
+  filterNode.frequency.value = 8000;
+  filterNode.Q.value = 1;
+
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = 0.6;
+
+  filterNode.connect(masterGain);
+  masterGain.connect(audioCtx.destination);
+
+  // Melody oscillator
+  melodyOsc = audioCtx.createOscillator();
+  melodyOsc.type = 'sine';
+  melodyOsc.frequency.value = 220;
+  melodyGain = audioCtx.createGain();
+  melodyGain.gain.value = 0.08;
+  melodyOsc.connect(melodyGain);
+  melodyGain.connect(filterNode);
+  melodyOsc.start();
+
+  // Tension layer: two detuned saws
+  tensionOsc1 = audioCtx.createOscillator();
+  tensionOsc1.type = 'sawtooth';
+  tensionOsc1.frequency.value = 55;
+  tensionOsc1.detune.value = 7;
+
+  tensionOsc2 = audioCtx.createOscillator();
+  tensionOsc2.type = 'sawtooth';
+  tensionOsc2.frequency.value = 55;
+  tensionOsc2.detune.value = -7;
+
+  tensionFilter = audioCtx.createBiquadFilter();
+  tensionFilter.type = 'lowpass';
+  tensionFilter.frequency.value = 300;
+
+  tensionGain = audioCtx.createGain();
+  tensionGain.gain.value = 0;
+
+  tensionOsc1.connect(tensionFilter);
+  tensionOsc2.connect(tensionFilter);
+  tensionFilter.connect(tensionGain);
+  tensionGain.connect(filterNode);
+  tensionOsc1.start();
+  tensionOsc2.start();
+
+  // Start sequencer
+  startSequencer();
+
+  // One-shot event triggers
+  bus.on('jump', playKick);
+  bus.on('land', playSnare);
+  bus.on('coin', playCoinBlip);
+  bus.on('damage', playDamageNoise);
+}
+
+// ─── Sequencer ──────────────────────────────────────────────
+const pattern = {
+  kick:  [1,0,0,0, 1,0,0,0, 1,0,0,0, 1,0,0,0],
+  snare: [0,0,0,0, 1,0,0,0, 0,0,0,0, 1,0,0,0],
+  hihat: [1,0,1,0, 1,0,1,0, 1,0,1,0, 1,0,1,0],
+};
+
+function startSequencer() {
+  if (sequencerTimer) clearInterval(sequencerTimer);
+  sequencerTimer = setInterval(stepSequencer, sequencerInterval);
+}
+
+function stepSequencer() {
+  const t = audioCtx.currentTime;
+  if (pattern.kick[sequencerStep]) playKick();
+  if (pattern.snare[sequencerStep]) playSnare();
+  if (pattern.hihat[sequencerStep]) playHihat();
+  sequencerStep = (sequencerStep + 1) % 16;
+}
+
+let lastTempoUpdate = 0;
+function updateSequencerTempo(bpm) {
+  const now = performance.now();
+  if (now - lastTempoUpdate < 200) return; // throttle to every 200ms
+  const newInterval = Math.max(50, (60 / bpm / 4) * 1000); // 16th notes, min 50ms
+  if (Math.abs(newInterval - sequencerInterval) > 10) {
+    lastTempoUpdate = now;
+    sequencerInterval = newInterval;
+    if (sequencerTimer) {
+      clearInterval(sequencerTimer);
+      sequencerTimer = setInterval(stepSequencer, sequencerInterval);
+    }
+  }
+}
+
+// ─── Sound Generators ───────────────────────────────────────
+function playKick() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(150, t);
+  osc.frequency.exponentialRampToValueAtTime(50, t + 0.12);
+  gain.gain.setValueAtTime(0.5, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+  osc.connect(gain);
+  gain.connect(filterNode);
+  osc.start(t);
+  osc.stop(t + 0.2);
+}
+
+function playSnare() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  // Noise burst
+  const bufLen = audioCtx.sampleRate * 0.1;
+  const buf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const bp = audioCtx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = 3000;
+  bp.Q.value = 1;
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.3, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+  src.connect(bp);
+  bp.connect(gain);
+  gain.connect(filterNode);
+  src.start(t);
+  src.stop(t + 0.1);
+}
+
+function playHihat() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const bufLen = audioCtx.sampleRate * 0.05;
+  const buf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const hp = audioCtx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 8000;
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.12, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+  src.connect(hp);
+  hp.connect(gain);
+  gain.connect(filterNode);
+  src.start(t);
+  src.stop(t + 0.05);
+}
+
+function playCoinBlip() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(400, t);
+  osc.frequency.exponentialRampToValueAtTime(800, t + 0.08);
+  gain.gain.setValueAtTime(0.25, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
+  osc.connect(gain);
+  gain.connect(filterNode);
+  osc.start(t);
+  osc.stop(t + 0.1);
+}
+
+function playDamageNoise() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const bufLen = audioCtx.sampleRate * 0.2;
+  const buf = audioCtx.createBuffer(1, bufLen, audioCtx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const bp = audioCtx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.value = 800;
+  bp.Q.value = 2;
+  const gain = audioCtx.createGain();
+  gain.gain.setValueAtTime(0.5, t);
+  gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+  src.connect(bp);
+  bp.connect(gain);
+  gain.connect(filterNode);
+  src.start(t);
+  src.stop(t + 0.2);
+}
+
+// ─── Parameter Mapper ───────────────────────────────────────
+function mapStateToAudio(s) {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  const ramp = 0.2;
+
+  // BPM → sequencer tempo
+  updateSequencerTempo(s.bpm);
+
+  // yPosition → melody frequency (range shifts up per level)
+  const [melLo, melHi] = MELODY_RANGES[currentLevel - 1];
+  const melFreq = lerp(melLo, melHi, s.yPosition);
+  melodyOsc.frequency.linearRampToValueAtTime(melFreq, t + ramp);
+
+  // Filter cutoff: health is the primary driver of clarity
+  // Low health = muddy (200Hz), full health = bright and open (10000Hz)
+  // Coins add extra sparkle on top (up to 4000Hz more)
+  const coinRatio = totalCoinsInLevel > 0 ? s.coinsCollected / totalCoinsInLevel : 0;
+  const healthCutoff = lerp(200, 10000, s.health);
+  const coinBoost = coinRatio * 4000;
+  const cutoff = Math.min(14000, healthCutoff + coinBoost);
+  filterNode.frequency.linearRampToValueAtTime(cutoff, t + ramp);
+
+  // Enemy proximity → tension gain (0–0.3)
+  const tGain = lerp(0, 0.3, s.enemyProximity);
+  tensionGain.gain.linearRampToValueAtTime(tGain, t + ramp);
+}
+
+// ─── Physics / Update ───────────────────────────────────────
+const GRAVITY = 0.55;
+const JUMP_VEL = -12;
+const MOVE_ACCEL = 0.5;
+const FRICTION = 0.85;
+const MAX_SPEED = 6;
+const dt = 1; // fixed step
+
+function processInput() {
+  const left = keys['ArrowLeft'] || keys['KeyA'];
+  const right = keys['ArrowRight'] || keys['KeyD'];
+  const jump = keys['ArrowUp'] || keys['KeyW'] || keys['Space'];
+
+  if (left) { player.vx -= MOVE_ACCEL; player.facing = -1; }
+  if (right) { player.vx += MOVE_ACCEL; player.facing = 1; }
+  if (!left && !right) player.vx *= FRICTION;
+
+  player.vx = clamp(player.vx, -MAX_SPEED, MAX_SPEED);
+  if (Math.abs(player.vx) < 0.1) player.vx = 0;
+
+  if (jump && player.grounded) {
+    player.vy = JUMP_VEL;
+    player.grounded = false;
+    bus.emit('jump');
+  }
+}
+
+function updatePhysics() {
+  // Gravity
+  player.vy += GRAVITY;
+  player.x += player.vx;
+  player.y += player.vy;
+
+  // Platform collisions
+  player.grounded = false;
+  for (const p of platforms) {
+    if (aabb(player, p)) {
+      // Resolve from top
+      const prevBottom = player.y + player.h - player.vy;
+      if (prevBottom <= p.y + 2 && player.vy >= 0) {
+        player.y = p.y - player.h;
+        if (player.vy > 2) bus.emit('land');
+        player.vy = 0;
+        player.grounded = true;
+      }
+    }
+  }
+
+  // World bounds
+  player.x = clamp(player.x, 0, LEVEL_WIDTH - player.w);
+  if (player.y > GROUND_Y + 100) {
+    // Fell off — reset
+    player.y = GROUND_Y - player.h;
+    player.vy = 0;
+    player.health = Math.max(0, player.health - 0.2);
+    bus.emit('damage');
+  }
+
+  // Enemy movement
+  for (const e of enemies) {
+    e.x += e.speed * e.dir;
+    if (e.x <= e.patrolLeft || e.x >= e.patrolRight) e.dir *= -1;
+    e.x = clamp(e.x, e.patrolLeft, e.patrolRight);
+  }
+
+  // Coin collection — coins heal the player
+  for (const c of coins) {
+    if (!c.collected && circleRect(c.x, c.y, 10, player)) {
+      c.collected = true;
+      state.coinsCollected++;
+      player.health = Math.min(1, player.health + 0.08); // each coin restores 8% health
+      bus.emit('coin');
+    }
+  }
+
+  // Level transition — reach far right edge
+  if (player.x > LEVEL_WIDTH - 120 && !levelTransitioning) {
+    nextLevel();
+  }
+
+  // Enemy collision
+  if (player.invincible > 0) {
+    player.invincible--;
+  } else {
+    for (const e of enemies) {
+      if (aabb(player, e)) {
+        player.health = Math.max(0, player.health - 0.15);
+        player.invincible = 60; // ~1s immunity
+        player.vy = -8;
+        player.vx = player.x < e.x ? -4 : 4;
+        bus.emit('damage');
+        break;
+      }
+    }
+  }
+}
+
+function aabb(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function circleRect(cx, cy, cr, r) {
+  const nx = clamp(cx, r.x, r.x + r.w);
+  const ny = clamp(cy, r.y, r.y + r.h);
+  const dx = cx - nx, dy = cy - ny;
+  return dx * dx + dy * dy < cr * cr;
+}
+
+function updateState() {
+  const maxVx = MAX_SPEED;
+  state.velocityX = player.vx / maxVx; // -1 to 1
+  state.velocityY = player.vy;
+  // yPosition: 0 at ground level, 1 at top of level
+  state.yPosition = clamp(1 - (player.y / GROUND_Y), 0, 1);
+  state.health = player.health;
+  state.isGrounded = player.grounded;
+  state.bpm = lerp(80, 180, Math.abs(state.velocityX));
+
+  // Closest enemy proximity (0 = far, 1 = touching)
+  let minDist = Infinity;
+  for (const e of enemies) {
+    const dx = (player.x + player.w / 2) - (e.x + e.w / 2);
+    const dy = (player.y + player.h / 2) - (e.y + e.h / 2);
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d < minDist) minDist = d;
+  }
+  state.enemyProximity = clamp(1 - minDist / 300, 0, 1);
+}
+
+// ─── Camera ─────────────────────────────────────────────────
+function updateCamera() {
+  const targetX = player.x - canvas.width * 0.35;
+  const targetY = player.y - canvas.height * 0.5;
+  camera.x += (targetX - camera.x) * 0.08;
+  camera.y += (targetY - camera.y) * 0.06;
+  camera.x = clamp(camera.x, 0, LEVEL_WIDTH - canvas.width);
+  camera.y = clamp(camera.y, -200, 100);
+}
+
+// ─── Render ─────────────────────────────────────────────────
+function render(time) {
+  const W = canvas.width, H = canvas.height;
+  const theme = LEVEL_THEMES[currentLevel - 1];
+  ctx.fillStyle = theme.bg;
+  ctx.fillRect(0, 0, W, H);
+
+  // Parallax layer 1: Stars (0.1x)
+  ctx.save();
+  const sx = camera.x * 0.1;
+  for (const s of stars) {
+    const px = s.x - sx;
+    if (px < -5 || px > W + 5) continue;
+    ctx.globalAlpha = s.b * (0.6 + 0.4 * Math.sin(time * 0.002 + s.x));
+    ctx.fillStyle = '#cce';
+    ctx.beginPath();
+    ctx.arc(px, s.y, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // Parallax layer 2: Mountains (0.3x)
+  ctx.save();
+  const mx = camera.x * 0.3;
+  for (const m of mountains) {
+    const px = m.x - mx;
+    if (px + m.w < 0 || px > W) continue;
+    ctx.fillStyle = m.c;
+    ctx.beginPath();
+    ctx.moveTo(px, H - 80);
+    ctx.lineTo(px + m.w / 2, H - 80 - m.h);
+    ctx.lineTo(px + m.w, H - 80);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // Parallax layer 3: Trees (0.6x)
+  ctx.save();
+  const tx = camera.x * 0.6;
+  for (const t of trees) {
+    const px = t.x - tx;
+    if (px < -30 || px > W + 30) continue;
+    ctx.fillStyle = t.c;
+    // Trunk
+    ctx.fillRect(px - 3, H - 60, 6, 20);
+    // Canopy
+    ctx.beginPath();
+    ctx.moveTo(px - 15, H - 60);
+    ctx.lineTo(px, H - 60 - t.h);
+    ctx.lineTo(px + 15, H - 60);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // World-space rendering
+  ctx.save();
+  ctx.translate(-camera.x, -camera.y);
+
+  // Platforms
+  for (const p of platforms) {
+    if (p.x + p.w < camera.x - 50 || p.x > camera.x + W + 50) continue;
+    if (p.h > 50) {
+      // Ground
+      ctx.fillStyle = theme.ground;
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = theme.accent;
+      ctx.fillRect(p.x, p.y, p.w, 4);
+    } else {
+      // Floating platform
+      ctx.fillStyle = theme.plat;
+      ctx.fillRect(p.x, p.y, p.w, p.h);
+      ctx.fillStyle = theme.platTop;
+      ctx.fillRect(p.x, p.y, p.w, 3);
+    }
+  }
+
+  // Coins
+  for (const c of coins) {
+    if (c.collected) continue;
+    if (c.x < camera.x - 20 || c.x > camera.x + W + 20) continue;
+    const bob = Math.sin(time * 0.004 + c.bobOffset) * 4;
+    ctx.fillStyle = '#fd0';
+    ctx.beginPath();
+    ctx.arc(c.x, c.y + bob, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fa0';
+    ctx.beginPath();
+    ctx.arc(c.x - 1, c.y + bob - 1, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Enemies
+  for (const e of enemies) {
+    if (e.x < camera.x - 40 || e.x > camera.x + W + 40) continue;
+    ctx.fillStyle = '#d44';
+    ctx.fillRect(e.x, e.y, e.w, e.h);
+    // Eyes
+    ctx.fillStyle = '#fff';
+    const ex = e.dir > 0 ? e.x + 16 : e.x + 4;
+    ctx.fillRect(ex, e.y + 6, 5, 5);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(ex + 1, e.y + 8, 3, 3);
+  }
+
+  // Player
+  const flashOn = player.invincible > 0 && Math.floor(player.invincible / 4) % 2 === 0;
+  if (!flashOn) {
+    // Body
+    ctx.fillStyle = '#4af';
+    ctx.fillRect(player.x, player.y, player.w, player.h);
+    // Eye
+    ctx.fillStyle = '#fff';
+    const eyeX = player.facing > 0 ? player.x + 18 : player.x + 4;
+    ctx.fillRect(eyeX, player.y + 8, 6, 6);
+    ctx.fillStyle = '#000';
+    const pupilX = player.facing > 0 ? eyeX + 2 : eyeX;
+    ctx.fillRect(pupilX, player.y + 10, 3, 3);
+    // Feet animation
+    if (!player.grounded) {
+      ctx.fillStyle = '#38e';
+      ctx.fillRect(player.x + 4, player.y + player.h, 8, 4);
+      ctx.fillRect(player.x + player.w - 12, player.y + player.h, 8, 4);
+    }
+  }
+
+  // Level end gate
+  if (currentLevel < MAX_LEVEL) {
+    const gateX = LEVEL_WIDTH - 80;
+    const gateH = 80;
+    const gateY = GROUND_Y - gateH;
+    // Pillars
+    ctx.fillStyle = '#6a6';
+    ctx.fillRect(gateX, gateY, 10, gateH);
+    ctx.fillRect(gateX + 50, gateY, 10, gateH);
+    // Arch
+    ctx.fillRect(gateX, gateY, 60, 8);
+    // Arrow
+    ctx.fillStyle = '#afa';
+    ctx.font = 'bold 24px monospace';
+    ctx.fillText('>>>', gateX + 8, gateY + 48);
+  } else {
+    // Final level — show finish flag
+    const gateX = LEVEL_WIDTH - 80;
+    ctx.fillStyle = '#fd0';
+    ctx.fillRect(gateX + 20, GROUND_Y - 90, 4, 90);
+    ctx.fillStyle = '#f55';
+    ctx.fillRect(gateX + 24, GROUND_Y - 90, 30, 20);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText('FIN', gateX + 26, GROUND_Y - 75);
+  }
+
+  ctx.restore();
+
+  // ─── HUD ────────────────────────────────────────────────
+  // Health bar
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(16, 16, 154, 20);
+  const hpColor = player.health > 0.5 ? '#4d4' : player.health > 0.25 ? '#da4' : '#d44';
+  ctx.fillStyle = hpColor;
+  ctx.fillRect(18, 18, 150 * player.health, 16);
+  ctx.strokeStyle = '#888';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(16, 16, 154, 20);
+
+  // Coins
+  ctx.fillStyle = '#fd0';
+  ctx.font = 'bold 18px monospace';
+  ctx.fillText(`🪙 ${state.coinsCollected}`, 20, 56);
+
+  // BPM
+  ctx.fillStyle = '#7af';
+  ctx.fillText(`♪ ${Math.round(state.bpm)} BPM`, 20, 78);
+
+  // Level indicator
+  ctx.fillStyle = '#adf';
+  ctx.fillText(`Level ${currentLevel} / ${MAX_LEVEL}`, 20, 100);
+
+  // Melody range indicator
+  const [mLo, mHi] = MELODY_RANGES[currentLevel - 1];
+  ctx.fillStyle = '#8a8';
+  ctx.font = '14px monospace';
+  ctx.fillText(`~ ${mLo}–${mHi} Hz`, 20, 118);
+
+  // Enemy proximity indicator
+  if (state.enemyProximity > 0.1) {
+    ctx.fillStyle = `rgba(255, 60, 60, ${state.enemyProximity * 0.3})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Level transition banner
+  if (levelBannerTimer > 0) {
+    levelBannerTimer--;
+    const alpha = levelBannerTimer > 90 ? 1 : levelBannerTimer / 90;
+    ctx.fillStyle = `rgba(10, 10, 26, ${alpha * 0.7})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = `rgba(120, 170, 255, ${alpha})`;
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`Level ${currentLevel}`, W / 2, H / 2 - 20);
+    ctx.font = '20px monospace';
+    ctx.fillStyle = `rgba(170, 220, 170, ${alpha})`;
+    const [lo, hi] = MELODY_RANGES[currentLevel - 1];
+    ctx.fillText(`Melody: ${lo}–${hi} Hz`, W / 2, H / 2 + 20);
+    ctx.textAlign = 'left';
+  }
+
+  // Victory screen
+  if (currentLevel >= MAX_LEVEL && player.x > LEVEL_WIDTH - 120) {
+    ctx.fillStyle = 'rgba(10, 10, 26, 0.8)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fd0';
+    ctx.font = 'bold 48px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('You Win!', W / 2, H / 2 - 20);
+    ctx.font = '20px monospace';
+    ctx.fillStyle = '#afa';
+    ctx.fillText(`Coins: ${state.coinsCollected}`, W / 2, H / 2 + 20);
+    ctx.textAlign = 'left';
+  }
+}
+
+// ─── Game Loop ──────────────────────────────────────────────
+let running = false;
+
+function gameLoop(time) {
+  if (!running) return;
+  processInput();
+  updatePhysics();
+  updateState();
+  updateCamera();
+  mapStateToAudio(state);
+  render(time);
+  requestAnimationFrame(gameLoop);
+}
+
+// ─── Start ──────────────────────────────────────────────────
+const overlay = document.getElementById('overlay');
+overlay.addEventListener('click', () => {
+  overlay.style.display = 'none';
+  initAudio();
+  running = true;
+  requestAnimationFrame(gameLoop);
+}, { once: true });
+
+})();
+</script>
+</body>
+</html>
